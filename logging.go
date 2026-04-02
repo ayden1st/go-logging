@@ -1,12 +1,14 @@
 package go_logging
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -31,18 +33,65 @@ type Config struct {
 	Service   string
 	Env       string
 	Version   string
+
+	// Форматирование времени
+	TimeFormat string         // "2006-01-02 15:04:05", "RFC3339", "" (default)
+	Timezone   *time.Location // time.UTC, time.Local, или custom
+	TimeKey    string         // ключ для времени в JSON (default: "time")
+
+	// Цветной вывод для консоли
+	ColorOutput bool // включить цвета для текстового вывода
+
+	// Асинхронное логирование
+	Async           bool // включить асинхронное логирование
+	AsyncBufferSize int  // размер буфера для асинхронного логирования
+}
+
+// Color — ANSI коды цветов
+type Color struct {
+	Code string
+	Bold bool
+}
+
+// Цвета для уровней логирования
+var (
+	ColorDebug = Color{Code: "\x1b[36m", Bold: false} // Cyan
+	ColorInfo  = Color{Code: "\x1b[32m", Bold: false} // Green
+	ColorWarn  = Color{Code: "\x1b[33m", Bold: false} // Yellow
+	ColorError = Color{Code: "\x1b[31m", Bold: true}  // Red bold
+	ColorReset = "\x1b[0m"
+)
+
+// LevelColor возвращает цвет для уровня логирования
+func LevelColor(level slog.Level) Color {
+	switch {
+	case level < slog.LevelInfo:
+		return ColorDebug
+	case level < slog.LevelWarn:
+		return ColorInfo
+	case level < slog.LevelError:
+		return ColorWarn
+	default:
+		return ColorError
+	}
 }
 
 // DefaultConfig возвращает стандартную конфигурацию
 func DefaultConfig() Config {
 	return Config{
-		Level:     slog.LevelInfo,
-		JSON:      true,
-		AddSource: false,
-		Output:    os.Stderr,
-		Service:   "unknown",
-		Env:       "unknown",
-		Version:   "dev",
+		Level:           slog.LevelInfo,
+		JSON:            true,
+		AddSource:       false,
+		Output:          os.Stderr,
+		Service:         "unknown",
+		Env:             "unknown",
+		Version:         "dev",
+		TimeFormat:      "2006-01-02 15:04:05",
+		Timezone:        time.Local,
+		TimeKey:         "time",
+		ColorOutput:     false,
+		Async:           false,
+		AsyncBufferSize: 1000,
 	}
 }
 
@@ -75,10 +124,200 @@ func newHandler(cfg Config) slog.Handler {
 		AddSource: cfg.AddSource,
 	}
 
-	if cfg.JSON {
-		return slog.NewJSONHandler(cfg.Output, opts)
+	var output io.Writer = cfg.Output
+
+	// Асинхронное логирование
+	if cfg.Async {
+		output = newAsyncWriter(cfg.Output, cfg.AsyncBufferSize)
 	}
-	return slog.NewTextHandler(cfg.Output, opts)
+
+	var baseHandler slog.Handler
+	if cfg.JSON {
+		baseHandler = slog.NewJSONHandler(output, opts)
+	} else {
+		baseHandler = slog.NewTextHandler(output, opts)
+	}
+
+	// Оборачиваем в customHandler только если нужна кастомизация
+	// (цвета или кастомный формат времени)
+	needsCustomHandler := cfg.ColorOutput && !cfg.JSON || cfg.TimeFormat != ""
+
+	if !needsCustomHandler {
+		return baseHandler
+	}
+
+	// Оборачиваем в customHandler для форматирования времени и цветов
+	return &customHandler{
+		handler:     baseHandler,
+		output:      output,
+		timeFormat:  cfg.TimeFormat,
+		timezone:    cfg.Timezone,
+		timeKey:     cfg.TimeKey,
+		colorOutput: cfg.ColorOutput && !cfg.JSON,
+	}
+}
+
+// customHandler — кастомный обработчик для форматирования времени и цветов
+type customHandler struct {
+	handler     slog.Handler
+	output      io.Writer
+	timeFormat  string
+	timezone    *time.Location
+	timeKey     string
+	colorOutput bool
+	attrs       []slog.Attr // сохранённые атрибуты из WithAttrs
+	mu          sync.Mutex
+}
+
+func (h *customHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.handler.Enabled(ctx, level)
+}
+
+func (h *customHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Для текстового вывода с цветами или кастомным форматом используем свой формат
+	if h.colorOutput || h.timeFormat != "" {
+		// Форматируем время
+		if h.timeFormat != "" {
+			tz := h.timezone
+			if tz == nil {
+				tz = time.Local
+			}
+			r.Time = r.Time.In(tz)
+		}
+		return h.handleWithFormat(ctx, r)
+	}
+
+	// Иначе используем стандартный handler
+	return h.handler.Handle(ctx, r)
+}
+
+func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) error {
+	var buf bytes.Buffer
+
+	// Время
+	timeFormat := h.timeFormat
+	if timeFormat == "" {
+		timeFormat = "2006-01-02 15:04:05" // формат по умолчанию
+	}
+	buf.WriteString(r.Time.Format(timeFormat))
+	buf.WriteString(" ")
+
+	// Уровень с цветом (если включено)
+	if h.colorOutput {
+		color := LevelColor(r.Level)
+		if color.Bold {
+			buf.WriteString("\x1b[1m")
+		}
+		buf.WriteString(color.Code)
+		buf.WriteString(r.Level.String())
+		buf.WriteString(ColorReset)
+		if color.Bold {
+			buf.WriteString("\x1b[22m")
+		}
+		buf.WriteString(" ")
+	} else {
+		buf.WriteString(r.Level.String())
+		buf.WriteString(" ")
+	}
+
+	// Сообщение
+	buf.WriteString(r.Message)
+
+	// Сначала выводим сохранённые атрибуты из WithAttrs
+	for _, attr := range h.attrs {
+		buf.WriteString(" ")
+		buf.WriteString(attr.Key)
+		buf.WriteString("=")
+		buf.WriteString(attr.Value.String())
+	}
+
+	// Затем атрибуты из текущей записи
+	r.Attrs(func(a slog.Attr) bool {
+		buf.WriteString(" ")
+		buf.WriteString(a.Key)
+		buf.WriteString("=")
+		buf.WriteString(a.Value.String())
+		return true
+	})
+
+	buf.WriteString("\n")
+
+	// Записываем в output
+	_, err := h.output.Write(buf.Bytes())
+	return err
+}
+
+func (h *customHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &customHandler{
+		handler:     h.handler.WithAttrs(attrs),
+		output:      h.output,
+		timeFormat:  h.timeFormat,
+		timezone:    h.timezone,
+		timeKey:     h.timeKey,
+		colorOutput: h.colorOutput,
+		attrs:       append(h.attrs, attrs...), // сохраняем атрибуты
+	}
+}
+
+func (h *customHandler) WithGroup(name string) slog.Handler {
+	return &customHandler{
+		handler:     h.handler.WithGroup(name),
+		output:      h.output,
+		timeFormat:  h.timeFormat,
+		timezone:    h.timezone,
+		timeKey:     h.timeKey,
+		colorOutput: h.colorOutput,
+	}
+}
+
+// asyncWriter — асинхронный writer для логирования
+type asyncWriter struct {
+	writer io.Writer
+	ch     chan []byte
+	wg     sync.WaitGroup
+	once   sync.Once
+}
+
+func newAsyncWriter(w io.Writer, bufferSize int) *asyncWriter {
+	aw := &asyncWriter{
+		writer: w,
+		ch:     make(chan []byte, bufferSize),
+	}
+	aw.wg.Add(1)
+	go aw.process()
+	return aw
+}
+
+func (aw *asyncWriter) process() {
+	defer aw.wg.Done()
+	for data := range aw.ch {
+		aw.writer.Write(data)
+	}
+}
+
+func (aw *asyncWriter) Write(p []byte) (int, error) {
+	// Копируем данные, чтобы избежать гонки данных
+	data := make([]byte, len(p))
+	copy(data, p)
+
+	select {
+	case aw.ch <- data:
+		return len(p), nil
+	default:
+		// Буфер полон, пишем синхронно
+		return aw.writer.Write(p)
+	}
+}
+
+func (aw *asyncWriter) Close() error {
+	aw.once.Do(func() {
+		close(aw.ch)
+		aw.wg.Wait()
+	})
+	return nil
 }
 
 // Get возвращает инициализированный логгер
@@ -155,12 +394,49 @@ func (l *Logger) SetLevel(level slog.Level) {
 	}
 }
 
-// Close — сбрасывает буфер (если Output — *os.File)
+// Close — сбрасывает буфер и закрывает асинхронный writer
 func (l *Logger) Close() error {
+	// Закрываем asyncWriter если используется
+	if l.Config.Async {
+		if aw, ok := l.Config.Output.(*asyncWriter); ok {
+			aw.Close()
+		}
+	}
+
+	// Сбрасываем буфер файла
 	if f, ok := l.Config.Output.(*os.File); ok {
 		return f.Sync()
 	}
 	return nil
+}
+
+// WithRequestID добавляет request ID к логгеру
+func (l *Logger) WithRequestID(id string) *Logger {
+	return l.With(slog.String("request_id", id))
+}
+
+// WithTraceID добавляет trace ID к логгеру
+func (l *Logger) WithTraceID(id string) *Logger {
+	return l.With(slog.String("trace_id", id))
+}
+
+// WithUserID добавляет user ID к логгеру
+func (l *Logger) WithUserID(id string) *Logger {
+	return l.With(slog.String("user_id", id))
+}
+
+// WithField добавляет произвольное поле к логгеру
+func (l *Logger) WithField(key string, value any) *Logger {
+	return l.With(slog.Any(key, value))
+}
+
+// WithFields добавляет несколько полей к логгеру
+func (l *Logger) WithFields(fields map[string]any) *Logger {
+	args := make([]any, 0, len(fields)*2)
+	for k, v := range fields {
+		args = append(args, k, v)
+	}
+	return l.With(args...)
 }
 
 // ParseLevel — парсит строку в slog.Level
