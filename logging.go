@@ -1,3 +1,6 @@
+// Package go_logging provides a structured logging wrapper around Go's slog package.
+// It supports JSON and text output, colored console output, custom time formatting,
+// timezone support, and asynchronous logging.
 package go_logging
 
 import (
@@ -16,7 +19,8 @@ var (
 	once     sync.Once
 )
 
-// Logger — обёртка над *slog.Logger
+// Logger is a wrapper around *slog.Logger that provides additional functionality
+// such as request/trace/user ID helpers, field management, and configuration.
 type Logger struct {
 	slogger *slog.Logger
 	Config  Config
@@ -24,7 +28,7 @@ type Logger struct {
 	groups  []string
 }
 
-// Config — настройки логгера
+// Config holds the configuration settings for the logger.
 type Config struct {
 	Level     slog.Level
 	JSON      bool
@@ -34,26 +38,26 @@ type Config struct {
 	Env       string
 	Version   string
 
-	// Форматирование времени
+	// Time formatting options
 	TimeFormat string         // "2006-01-02 15:04:05", "RFC3339", "" (default)
-	Timezone   *time.Location // time.UTC, time.Local, или custom
-	TimeKey    string         // ключ для времени в JSON (default: "time")
+	Timezone   *time.Location // time.UTC, time.Local, or custom
+	TimeKey    string         // key for time in JSON (default: "time")
 
-	// Цветной вывод для консоли
-	ColorOutput bool // включить цвета для текстового вывода
+	// Color output for console
+	ColorOutput bool // enable colors for text output
 
-	// Асинхронное логирование
-	Async           bool // включить асинхронное логирование
-	AsyncBufferSize int  // размер буфера для асинхронного логирования
+	// Asynchronous logging
+	Async           bool // enable asynchronous logging
+	AsyncBufferSize int  // buffer size for asynchronous logging
 }
 
-// Color — ANSI коды цветов
+// Color represents ANSI color codes with optional bold formatting.
 type Color struct {
 	Code string
 	Bold bool
 }
 
-// Цвета для уровней логирования
+// Color constants for different log levels.
 var (
 	ColorDebug = Color{Code: "\x1b[36m", Bold: false} // Cyan
 	ColorInfo  = Color{Code: "\x1b[32m", Bold: false} // Green
@@ -62,7 +66,7 @@ var (
 	ColorReset = "\x1b[0m"
 )
 
-// LevelColor возвращает цвет для уровня логирования
+// LevelColor returns the appropriate color for a given log level.
 func LevelColor(level slog.Level) Color {
 	switch {
 	case level < slog.LevelInfo:
@@ -76,7 +80,9 @@ func LevelColor(level slog.Level) Color {
 	}
 }
 
-// DefaultConfig возвращает стандартную конфигурацию
+// DefaultConfig returns a configuration with sensible defaults.
+// Defaults: Level=Info, JSON=true, AddSource=false, Output=stderr,
+// TimeFormat="2006-01-02 15:04:05", Timezone=Local, ColorOutput=false, Async=false.
 func DefaultConfig() Config {
 	return Config{
 		Level:           slog.LevelInfo,
@@ -95,7 +101,10 @@ func DefaultConfig() Config {
 	}
 }
 
-// Init инициализирует логгер. Можно вызывать только один раз.
+// Init initializes the global logger instance. This function can only be called once.
+// Subsequent calls will return the already initialized instance.
+// The logger is automatically configured with service, env, and version attributes
+// if they are provided in the config.
 func Init(cfg Config) *Logger {
 	once.Do(func() {
 		handler := newHandler(cfg)
@@ -117,7 +126,8 @@ func Init(cfg Config) *Logger {
 	return instance
 }
 
-// newHandler создаёт обработчик
+// newHandler creates a new slog.Handler based on the provided configuration.
+// It supports JSON/text output, async logging, custom time formatting, and colored output.
 func newHandler(cfg Config) slog.Handler {
 	opts := &slog.HandlerOptions{
 		Level:     cfg.Level,
@@ -126,7 +136,6 @@ func newHandler(cfg Config) slog.Handler {
 
 	var output io.Writer = cfg.Output
 
-	// Асинхронное логирование
 	if cfg.Async {
 		output = newAsyncWriter(cfg.Output, cfg.AsyncBufferSize)
 	}
@@ -138,15 +147,12 @@ func newHandler(cfg Config) slog.Handler {
 		baseHandler = slog.NewTextHandler(output, opts)
 	}
 
-	// Оборачиваем в customHandler только если нужна кастомизация
-	// (цвета или кастомный формат времени)
 	needsCustomHandler := cfg.ColorOutput && !cfg.JSON || cfg.TimeFormat != ""
 
 	if !needsCustomHandler {
 		return baseHandler
 	}
 
-	// Оборачиваем в customHandler для форматирования времени и цветов
 	return &customHandler{
 		handler:     baseHandler,
 		output:      output,
@@ -157,7 +163,8 @@ func newHandler(cfg Config) slog.Handler {
 	}
 }
 
-// customHandler — кастомный обработчик для форматирования времени и цветов
+// customHandler is a custom slog.Handler that provides custom time formatting
+// and colored console output.
 type customHandler struct {
 	handler     slog.Handler
 	output      io.Writer
@@ -165,7 +172,7 @@ type customHandler struct {
 	timezone    *time.Location
 	timeKey     string
 	colorOutput bool
-	attrs       []slog.Attr // сохранённые атрибуты из WithAttrs
+	attrs       []slog.Attr
 	mu          sync.Mutex
 }
 
@@ -177,9 +184,7 @@ func (h *customHandler) Handle(ctx context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Для текстового вывода с цветами или кастомным форматом используем свой формат
 	if h.colorOutput || h.timeFormat != "" {
-		// Форматируем время
 		if h.timeFormat != "" {
 			tz := h.timezone
 			if tz == nil {
@@ -190,14 +195,12 @@ func (h *customHandler) Handle(ctx context.Context, r slog.Record) error {
 		return h.handleWithFormat(ctx, r)
 	}
 
-	// Иначе используем стандартный handler
 	return h.handler.Handle(ctx, r)
 }
 
 func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) error {
 	var buf bytes.Buffer
 
-	// Время
 	timeFormat := h.timeFormat
 	if timeFormat == "" {
 		timeFormat = "2006-01-02 15:04:05" // формат по умолчанию
@@ -205,7 +208,6 @@ func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) err
 	buf.WriteString(r.Time.Format(timeFormat))
 	buf.WriteString(" ")
 
-	// Уровень с цветом (если включено)
 	if h.colorOutput {
 		color := LevelColor(r.Level)
 		if color.Bold {
@@ -223,10 +225,8 @@ func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) err
 		buf.WriteString(" ")
 	}
 
-	// Сообщение
 	buf.WriteString(r.Message)
 
-	// Сначала выводим сохранённые атрибуты из WithAttrs
 	for _, attr := range h.attrs {
 		buf.WriteString(" ")
 		buf.WriteString(attr.Key)
@@ -234,7 +234,6 @@ func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) err
 		buf.WriteString(attr.Value.String())
 	}
 
-	// Затем атрибуты из текущей записи
 	r.Attrs(func(a slog.Attr) bool {
 		buf.WriteString(" ")
 		buf.WriteString(a.Key)
@@ -245,7 +244,6 @@ func (h *customHandler) handleWithFormat(ctx context.Context, r slog.Record) err
 
 	buf.WriteString("\n")
 
-	// Записываем в output
 	_, err := h.output.Write(buf.Bytes())
 	return err
 }
@@ -258,7 +256,7 @@ func (h *customHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		timezone:    h.timezone,
 		timeKey:     h.timeKey,
 		colorOutput: h.colorOutput,
-		attrs:       append(h.attrs, attrs...), // сохраняем атрибуты
+		attrs:       append(h.attrs, attrs...),
 	}
 }
 
@@ -273,7 +271,8 @@ func (h *customHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// asyncWriter — асинхронный writer для логирования
+// asyncWriter is an asynchronous writer that buffers log messages and writes them
+// in a separate goroutine. If the buffer is full, it falls back to synchronous writing.
 type asyncWriter struct {
 	writer io.Writer
 	ch     chan []byte
@@ -281,6 +280,8 @@ type asyncWriter struct {
 	once   sync.Once
 }
 
+// newAsyncWriter creates a new asyncWriter with the specified buffer size.
+// The writer starts a background goroutine to process log messages.
 func newAsyncWriter(w io.Writer, bufferSize int) *asyncWriter {
 	aw := &asyncWriter{
 		writer: w,
@@ -291,6 +292,7 @@ func newAsyncWriter(w io.Writer, bufferSize int) *asyncWriter {
 	return aw
 }
 
+// process runs in a background goroutine and writes buffered messages to the underlying writer.
 func (aw *asyncWriter) process() {
 	defer aw.wg.Done()
 	for data := range aw.ch {
@@ -298,8 +300,10 @@ func (aw *asyncWriter) process() {
 	}
 }
 
+// Write writes data to the async buffer. If the buffer is full, it falls back to
+// synchronous writing to avoid blocking.
 func (aw *asyncWriter) Write(p []byte) (int, error) {
-	// Копируем данные, чтобы избежать гонки данных
+	// Copy data to avoid data race
 	data := make([]byte, len(p))
 	copy(data, p)
 
@@ -307,11 +311,12 @@ func (aw *asyncWriter) Write(p []byte) (int, error) {
 	case aw.ch <- data:
 		return len(p), nil
 	default:
-		// Буфер полон, пишем синхронно
+		// Buffer is full, write synchronously
 		return aw.writer.Write(p)
 	}
 }
 
+// Close closes the async channel and waits for all buffered messages to be written.
 func (aw *asyncWriter) Close() error {
 	aw.once.Do(func() {
 		close(aw.ch)
@@ -320,7 +325,8 @@ func (aw *asyncWriter) Close() error {
 	return nil
 }
 
-// Get возвращает инициализированный логгер
+// Get returns the initialized global logger instance.
+// Panics if Init has not been called.
 func Get() *Logger {
 	if instance == nil {
 		panic("logging: Init must be called before Get")
@@ -328,39 +334,43 @@ func Get() *Logger {
 	return instance
 }
 
-// Slog возвращает *slog.Logger для совместимости
+// Slog returns the underlying *slog.Logger for compatibility with slog-based code.
 func (l *Logger) Slog() *slog.Logger {
 	return l.slogger
 }
 
-// Логирование с уровнем
+// Debug logs a message at Debug level.
 func (l *Logger) Debug(msg string, args ...any) {
 	l.slogger.Debug(msg, args...)
 }
 
+// Info logs a message at Info level.
 func (l *Logger) Info(msg string, args ...any) {
 	l.slogger.Info(msg, args...)
 }
 
+// Warn logs a message at Warn level.
 func (l *Logger) Warn(msg string, args ...any) {
 	l.slogger.Warn(msg, args...)
 }
 
+// Error logs a message at Error level.
 func (l *Logger) Error(msg string, args ...any) {
 	l.slogger.Error(msg, args...)
 }
 
-// Fatal — логирует и завершает программу
+// Fatal logs a message at Error level and terminates the program with exit code 1.
 func (l *Logger) Fatal(msg string, args ...any) {
 	l.slogger.Error(msg, args...)
 	os.Exit(1)
 }
 
-// Log — с контекстом и уровнем
+// Log logs a message at the specified level with the given context.
 func (l *Logger) Log(ctx context.Context, level slog.Level, msg string, args ...any) {
 	l.slogger.Log(ctx, level, msg, args...)
 }
 
+// With returns a new Logger with the given key-value pairs added to all log entries.
 func (l *Logger) With(args ...any) *Logger {
 	return &Logger{
 		slogger: l.slogger.With(args...),
@@ -370,6 +380,8 @@ func (l *Logger) With(args ...any) *Logger {
 	}
 }
 
+// WithGroup returns a new Logger with a group name. All subsequent attributes
+// will be grouped under this name.
 func (l *Logger) WithGroup(name string) *Logger {
 	return &Logger{
 		slogger: l.slogger.WithGroup(name),
@@ -379,7 +391,7 @@ func (l *Logger) WithGroup(name string) *Logger {
 	}
 }
 
-// SetLevel — изменяет уровень логирования
+// SetLevel changes the log level dynamically. Preserves existing groups and attributes.
 func (l *Logger) SetLevel(level slog.Level) {
 	l.Config.Level = level
 	handler := newHandler(l.Config)
@@ -394,43 +406,44 @@ func (l *Logger) SetLevel(level slog.Level) {
 	}
 }
 
-// Close — сбрасывает буфер и закрывает асинхронный writer
+// Close flushes any buffered logs and closes the async writer if enabled.
+// Also syncs the file buffer if writing to a file.
 func (l *Logger) Close() error {
-	// Закрываем asyncWriter если используется
+	// Close asyncWriter if in use
 	if l.Config.Async {
 		if aw, ok := l.Config.Output.(*asyncWriter); ok {
 			aw.Close()
 		}
 	}
 
-	// Сбрасываем буфер файла
+	// Flush file buffer
 	if f, ok := l.Config.Output.(*os.File); ok {
 		return f.Sync()
 	}
 	return nil
 }
 
-// WithRequestID добавляет request ID к логгеру
+// WithRequestID returns a new Logger with a request_id field added to all log entries.
 func (l *Logger) WithRequestID(id string) *Logger {
 	return l.With(slog.String("request_id", id))
 }
 
-// WithTraceID добавляет trace ID к логгеру
+// WithTraceID returns a new Logger with a trace_id field added to all log entries.
 func (l *Logger) WithTraceID(id string) *Logger {
 	return l.With(slog.String("trace_id", id))
 }
 
-// WithUserID добавляет user ID к логгеру
+// WithUserID returns a new Logger with a user_id field added to all log entries.
 func (l *Logger) WithUserID(id string) *Logger {
 	return l.With(slog.String("user_id", id))
 }
 
-// WithField добавляет произвольное поле к логгеру
+// WithField returns a new Logger with a custom field added to all log entries.
 func (l *Logger) WithField(key string, value any) *Logger {
 	return l.With(slog.Any(key, value))
 }
 
-// WithFields добавляет несколько полей к логгеру
+// WithFields returns a new Logger with multiple fields added to all log entries.
 func (l *Logger) WithFields(fields map[string]any) *Logger {
 	args := make([]any, 0, len(fields)*2)
 	for k, v := range fields {
@@ -439,7 +452,9 @@ func (l *Logger) WithFields(fields map[string]any) *Logger {
 	return l.With(args...)
 }
 
-// ParseLevel — парсит строку в slog.Level
+// ParseLevel converts a string to a slog.Level.
+// Supported values (case-insensitive): "debug", "info", "warn", "warning", "error".
+// Defaults to Info level for unrecognized values.
 func ParseLevel(levelStr string) slog.Level {
 	switch strings.ToLower(levelStr) {
 	case "debug":

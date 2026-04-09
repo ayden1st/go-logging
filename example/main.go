@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	// Настройка логгера
+	// initialize logging
 	cfg := logging.DefaultConfig()
 	cfg.Level = logging.ParseLevel("debug")
 	cfg.Service = "myapp"
@@ -24,15 +24,15 @@ func main() {
 	logg.Info("Service started", "pid", os.Getpid())
 	logg.Debug("This is a debug message")
 
-	// Контекстные логи
+	// Context
 	reqLog := logg.With("request_id", "abc123", "method", "GET")
 	reqLog.Info("Handling request")
 
-	// Группировка
+	// Group
 	dbLog := logg.WithGroup("database").With("table", "users")
 	dbLog.Warn("Query took too long", "duration_ms", 150)
 
-	// Ошибка
+	// Error
 	dbLog.Error("Failed to insert", "err", "duplicate key")
 
 	// Fatal
